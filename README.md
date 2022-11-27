@@ -74,13 +74,13 @@
     
     Add the following and change the paths to accordingly:
     ```bash
-server {
+    server {
     listen 8080;
-    location / {
-        include proxy_params;
-        proxy_pass http://unix:/home/daniel/Desktop/gunicornws/ml.sock;
+        location / {
+            include proxy_params;
+            proxy_pass http://unix:/home/daniel/Desktop/gunicornws/ml.sock;
+        }
     }
-}
     ```
     
     Enable the configuration:
