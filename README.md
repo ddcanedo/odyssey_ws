@@ -72,13 +72,18 @@
     sudo nano /etc/nginx/sites-available/ml
     ```
     
-    Add the following and change the paths to accordingly:
+    Add the following and change the paths to accordingly (1h of time out as default, change if needed):
     ```bash
     server {
     listen 8080;
         location / {
             include proxy_params;
             proxy_pass http://unix:/home/daniel/Desktop/gunicornws/ml.sock;
+            proxy_connect_timeout 3600;
+            proxy_send_timeout 3600;
+            proxy_read_timeout 3600;
+            send_timeout 3600;
+
         }
     }
     ```
