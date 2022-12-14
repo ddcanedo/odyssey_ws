@@ -36,7 +36,7 @@
     sudo nano /etc/systemd/system/ml.service
     ```
     
-    Add the following and change the paths to accordingly:
+    Add the following and change the paths accordingly:
     ```bash
     [Unit]
     Description=Gunicorn instance to serve ml
