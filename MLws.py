@@ -10,21 +10,22 @@ import csv
 import numpy as np 
 import cv2
 import rasterio
-from PIL import Image
+from PIL import Image, ImageDraw
 import torch
-from models.experimental import attempt_load
-import torch.backends.cudnn as cudnn
-from utils.torch_utils import select_device
-from utils.general import check_img_size, non_max_suppression, scale_coords
+from models.common import DetectMultiBackend
 from utils.augmentations import letterbox
+from utils.general import (Profile, check_img_size, non_max_suppression, scale_boxes)
+from utils.torch_utils import select_device
 import laspy
 import pickle
 from flask import request, Flask
 import json
 from jakteristics import las_utils, compute_features, FEATURE_NAMES
-from shapely.geometry import Polygon
+from shapely.geometry import Point, Polygon
 from shapely.wkt import loads
 import random
+import pyqtree
+
 
 csv.field_size_limit(sys.maxsize)
 app = Flask(__name__)
@@ -34,47 +35,52 @@ Image.MAX_IMAGE_PIXELS = None
 def poly2bb(annotations, xMinImg, xMaxImg, yMaxImg, yMinImg, width, height):
 	bbs = {}
 	for key in annotations:
-		bbs[key] = []
-		raw = annotations[key].replace(", ", ",").split(",")
+		wkt = annotations[key].replace(", ", ",")
 
-		raw[0] = raw[0].strip(raw[0][:raw[0].find("(")] + "(((")
-		raw[len(raw)-1] = raw[len(raw)-1][:len(raw[len(raw)-1])-2]
+		polygonStrings = wkt[16:-3].split(")),((")
+		
+		# Iterate through the polygon strings
+		for polygonStr in polygonStrings:
+			# Split the polygon string into point strings
+			pointStrings = polygonStr.split(",")
+			polygonPoints = []
+			xPoints = []
+			yPoints = []
+			# Iterate through the point strings
+			for pointStr in pointStrings:
+				# Split the point string into x and y values
+				x, y = map(float, pointStr.split(" "))
+				xPoints.append(x)
+				yPoints.append(y)
+				polygonPoints.append([x, y])
 
-		xPoints = []
-		yPoints = []
-		for i in range(0, len(raw)):
-			if raw[i][len(raw[i])-1] != ")":
-				if raw[i][0] != "(":
-					xPoints.append(float(raw[i].split(" ")[0]))
-				else:
-					xPoints.append(float(raw[i].split(" ")[0].strip("((")))
-				yPoints.append(float(raw[i].split(" ")[1]))
-			else:
-				xPoints.append(float(raw[i].split(" ")[0]))
-				yPoints.append(float(raw[i].split(" ")[1].strip(")")))
+			xMin = min(xPoints)
+			xMax = max(xPoints)
+			yMin = min(yPoints)
+			yMax = max(yPoints)
 
-				xMin = min(xPoints)
-				xMax = max(xPoints)
-				yMin = min(yPoints)
-				yMax = max(yPoints)
+			# The bounding box must be within the image limits
+			if xMin >= xMinImg and xMax <= xMaxImg and yMin >= yMinImg and yMax <= yMaxImg:
 
-				# The bounding box must be within the image limits
-				if xMin >= xMinImg and xMax <= xMaxImg and yMin >= yMinImg and yMax <= yMaxImg:
+				# Maps coordinates from GIS reference to image pixels
+				xMinBb = round(mapping(xMin, xMinImg, xMaxImg, 0, width))
+				xMaxBb = round(mapping(xMax, xMinImg, xMaxImg, 0, width))
+				yMaxBb = round(mapping(yMin, yMinImg, yMaxImg, height, 0))
+				yMinBb = round(mapping(yMax, yMinImg, yMaxImg, height, 0))
 
-					# Maps coordinates from GIS reference to image pixels
-					xMinBb = int(map(xMin, xMinImg, xMaxImg, 0, width))
-					xMaxBb = int(map(xMax, xMinImg, xMaxImg, 0, width))
-					yMaxBb = int(map(yMin, yMinImg, yMaxImg, height, 0))
-					yMinBb = int(map(yMax, yMinImg, yMaxImg, height, 0))
-					xPoints = []
-					yPoints = []
+				polygon = []
+				for p in polygonPoints:
+					xPoly = mapping(p[0], xMinImg, xMaxImg, 0, width)
+					yPoly = mapping(p[1], yMinImg, yMaxImg, height, 0)
+					polygon.append([xPoly, yPoly])
 
-					bbs[key].append((xMinBb, xMaxBb, yMinBb, yMaxBb))
+				bbs[(xMinBb, xMaxBb, yMinBb, yMaxBb)] = [key, polygon]
+
 	return bbs
 
 
 # Converts coordinates from GIS reference to image pixels
-def map(value, min1, max1, min2, max2):
+def mapping(value, min1, max1, min2, max2):
 	return (((value - min1) * (max2 - min2)) / (max1 - min1)) + min2
 
 # Intersection over Union
@@ -93,58 +99,182 @@ def getIou(boxA, boxB):
 	iou = interArea / float(boxAArea + boxBArea - interArea)
 	return iou
 
+# Non maximum suppression to deal with overlapped detection due to the sliding window step
+def nms(boxes, overlapThresh):
+	# if there are no boxes, return an empty list
+	boxes = np.array(boxes)
+	if len(boxes) == 0:
+		return []
+	# if the bounding boxes integers, convert them to floats --
+	# this is important since we'll be doing a bunch of divisions
+	if boxes.dtype.kind == "i":
+		boxes = boxes.astype("float")
+	# initialize the list of picked indexes	
+	pick = []
+	# grab the coordinates of the bounding boxes
+	x1 = boxes[:,0]
+	y1 = boxes[:,2]
+	x2 = boxes[:,1]
+	y2 = boxes[:,3]
+	# compute the area of the bounding boxes and sort the bounding
+	# boxes by the bottom-right y-coordinate of the bounding box
+	area = (x2 - x1 + 1) * (y2 - y1 + 1)
+	idxs = np.argsort(y2)
+	# keep looping while some indexes still remain in the indexes
+	# list
+	while len(idxs) > 0:
+		# grab the last index in the indexes list and add the
+		# index value to the list of picked indexes
+		last = len(idxs) - 1
+		i = idxs[last]
+		pick.append(i)
+		# find the largest (x, y) coordinates for the start of
+		# the bounding box and the smallest (x, y) coordinates
+		# for the end of the bounding box
+		xx1 = np.maximum(x1[i], x1[idxs[:last]])
+		yy1 = np.maximum(y1[i], y1[idxs[:last]])
+		xx2 = np.minimum(x2[i], x2[idxs[:last]])
+		yy2 = np.minimum(y2[i], y2[idxs[:last]])
+		# compute the width and height of the bounding box
+		w = np.maximum(0, xx2 - xx1 + 1)
+		h = np.maximum(0, yy2 - yy1 + 1)
+		# compute the ratio of overlap
+		overlap = (w * h) / area[idxs[:last]]
+		# delete all indexes from the index list that have
+		idxs = np.delete(idxs, np.concatenate(([last],
+			np.where(overlap > overlapThresh)[0])))
+	# return only the bounding boxes that were picked using the
+	# integer data type
+	return boxes[pick].astype("int")
+
 # Convert the detection to real world coordinates
 def convert2GIS(xyxy, cropExtent, width, height, resolution, xMinImg, yMinImg, xMaxImg, yMaxImg):
 
-	xMin = map(int(xyxy[0]), 0, resolution, cropExtent[0], cropExtent[1])
-	xMax = map(int(xyxy[2]), 0, resolution, cropExtent[0], cropExtent[1])
-	yMin = map(int(xyxy[3]), 0, resolution, cropExtent[2], cropExtent[3])
-	yMax = map(int(xyxy[1]), 0, resolution, cropExtent[2], cropExtent[3])
+	xMin = mapping(int(xyxy[0]), 0, resolution, cropExtent[0], cropExtent[1])
+	xMax = mapping(int(xyxy[2]), 0, resolution, cropExtent[0], cropExtent[1])
+	yMin = mapping(int(xyxy[3]), 0, resolution, cropExtent[2], cropExtent[3])
+	yMax = mapping(int(xyxy[1]), 0, resolution, cropExtent[2], cropExtent[3])
 
-	xMin = map(xMin, 0, width, xMinImg, xMaxImg)
-	xMax = map(xMax, 0, width, xMinImg, xMaxImg)
-	yMax = map(yMax, height, 0, yMinImg, yMaxImg)
-	yMin = map(yMin, height, 0, yMinImg, yMaxImg)
+	xMin = mapping(xMin, 0, width, xMinImg, xMaxImg)
+	xMax = mapping(xMax, 0, width, xMinImg, xMaxImg)
+	yMax = mapping(yMax, height, 0, yMinImg, yMaxImg)
+	yMin = mapping(yMin, height, 0, yMinImg, yMaxImg)
 
-	return (xMin, xMax, yMin, yMax), "((" + str(xMin) + " " + str(yMin) + "," + str(xMin) + " " + str(yMax) + "," + str(xMax) + " " + str(yMax) + "," + str(xMax) + " " + str(yMin) + "))"
+	return (xMin, xMax, yMin, yMax)
+
+
+# Saves the corresponding point cloud to the cropped region
+def pointCloudCrop(spindex, LASPath, image, coords, crop, visibleObjects, imgName, pointClouds, xMinImg, xMaxImg, yMinImg, yMaxImg, width, height, resolution):
+	# Gets one cloud to later use its header to write an empty .las file
+	tmp = ''
+	for cloud in os.listdir(pointClouds):
+		tmp = pointClouds + '/' + cloud
+		break
+
+	cloudName = LASPath + image.split("/")[-1].split(".")[0] + coords + ".las"
+
+	# Creates empty .las file to later populate it with points
+	clouds = {}
+	with laspy.open(tmp) as f:
+		for i in range(len(visibleObjects)):
+			c = cloudName.split('.')[0] + str(i) + '.las'
+			clouds[c] = 0
+			w = laspy.open(c, mode='w', header = f.header)
+			w.close()
+
+	for i in range(len(visibleObjects)):
+		# Gets bounding box in GIS reference
+		xMin = mapping(visibleObjects[i][0], 0, width, xMinImg, xMaxImg)
+		xMax = mapping(visibleObjects[i][1], 0, width, xMinImg, xMaxImg)
+		yMax = mapping(visibleObjects[i][2], height, 0, yMinImg, yMaxImg)
+		yMin = mapping(visibleObjects[i][3], height, 0, yMinImg, yMaxImg)
+
+		matches = spindex.intersect((xMin,yMin,xMax,yMax))
+
+		for match in matches:
+			with laspy.open(match) as f:
+				# Checks if there is an overlap with the cropped image and the point cloud
+				if xMin <= f.header.x_max and xMax >= f.header.x_min and yMin <= f.header.y_max and yMax >= f.header.y_min:
+					las = f.read()
+					# Appends the points of the overlapping region to the previously created .las file
+					          
+					x, y = las.points[las.classification == 2].x.copy(), las.points[las.classification == 2].y.copy()
+					mask = (x >= xMin) & (x <= xMax) & (y >= yMin) & (y <= yMax)
+					if True in mask:
+						roi = las.points[las.classification == 2][mask]
+
+						with laspy.open(cloudName.split('.')[0] + str(i) + '.las', mode = 'a') as w:
+							w.append_points(roi)
+							# Updates the previously created .las file header
+							if clouds[cloudName.split('.')[0] + str(i) + '.las'] == 0:
+								w.header.x_min = np.min(roi.x)
+								w.header.y_min = np.min(roi.y)
+								w.header.z_min = np.min(roi.z)
+								w.header.x_max = np.max(roi.x)
+								w.header.y_max = np.max(roi.y)
+								w.header.z_max = np.max(roi.z)
+							else:
+								if w.header.x_min > np.min(roi.x):
+									w.header.x_min = np.min(roi.x)
+								if w.header.y_min > np.min(roi.y):
+									w.header.y_min = np.min(roi.y)
+								if w.header.z_min > np.min(roi.z):
+									w.header.z_min = np.min(roi.z)
+								if w.header.x_max < np.max(roi.x):
+									w.header.x_max = np.max(roi.x)
+								if w.header.y_max < np.max(roi.y):
+									w.header.y_max = np.max(roi.y)
+								if w.header.z_max < np.max(roi.z):
+									w.header.z_max = np.max(roi.z)
+
+						clouds[cloudName.split('.')[0] + str(i) + '.las'] += 1
+
+	# If .las file was not populated with points, deletes it
+	for c in clouds:
+		with laspy.open(c) as f:
+			las = f.read()
+			if clouds[c] == 0:
+				os.remove(c)				
 
 
 # Validates a detection using the Point Clouds
-def pointCloud(validationModel, pointClouds, cropExtent, className, bb):
-	tmp = ""
+def pointCloud(spindex, validationModel, pointClouds, cropExtent, className, bb):
+	tmp = ''
 	for cloud in os.listdir(pointClouds):
-		tmp = pointClouds + "/" + cloud
+		tmp = pointClouds + '/' + cloud
 		break
+
 
 	# Creates empty .las file to later populate it with points
 	with laspy.open(tmp) as f:
-		w = laspy.open("tmp.las", mode="w", header = f.header)
+		w = laspy.open('tmp.las', mode='w', header = f.header)
 		w.close()
 
 	count = 0
-	# Iterates over the point clouds
-	with laspy.open("tmp.las", mode = "a") as w:
-		for cloud in os.listdir(pointClouds):
-			with laspy.open(pointClouds + "/" + cloud) as f:
+	# Checks if there is an overlap with the cropped image and the point cloud
+	matches = spindex.intersect((bb[0], bb[2], bb[1], bb[3]))
+
+	# Iterates over the matched Point Clouds
+	with laspy.open('tmp.las', mode = 'a') as w:
+		for match in matches:
+			with laspy.open(match) as f:
+				las = f.read()          
+				x, y = las.points[las.classification == 2].x.copy(), las.points[las.classification == 2].y.copy()
+				mask = (x >= bb[0]) & (x <= bb[1]) & (y >= bb[2]) & (y <= bb[3])
 				# Checks if there is an overlap with the cropped image and the point cloud
-				if bb[0] <= f.header.x_max and bb[1] >= f.header.x_min and bb[2] <= f.header.y_max and bb[3] >= f.header.y_min:
+				if True in mask:
+					roi = las.points[las.classification == 2][mask]
 					# Appends the points of the overlapping region to the previously created .las file
-					las = f.read()          
-					x, y = las.points.x.copy(), las.points.y.copy()
-					mask = (x >= bb[0]) & (x <= bb[1]) & (y >= bb[2]) & (y <= bb[3])
-					roi = las.points[mask]
 					w.append_points(roi)
 					count += 1
-	
-	# If temporary las was populated with points
-	if count > 0:
-		xyz = las_utils.read_las_xyz("tmp.las")
 
+	# If temporary las was populated with points	
+	if count > 0:
+		xyz = las_utils.read_las_xyz('tmp.las')
 		# Compute 3D features
 		features = compute_features(xyz, search_radius=3)
 		
 		if np.isnan(features).any() == False:
-
 			stats = {}
 			for i in FEATURE_NAMES:
 				stats[i] = []
@@ -153,17 +283,18 @@ def pointCloud(validationModel, pointClouds, cropExtent, className, bb):
 				for i in range(len(FEATURE_NAMES)):
 					stats[FEATURE_NAMES[i]].append(feature[i])
 
-			# Each point contributes to 14 features which is too heavy, therefore calculate
-			# the mean and standard deviation of of every feature for each point
 			X = []
+			# Each point contributes to 14 features which is too heavy, therefore calculate
+			# the median, standard deviation, variance, and covariance of every feature for each point
 			for i in FEATURE_NAMES:		
-				mean = np.mean(stats[i])
+				median = np.median(stats[i])
 				stdev = np.std(stats[i])
-				X += [mean,stdev]
-
-			# Removes temporary las
-			os.remove("tmp.las")
+				var = np.var(stats[i])
+				cov = np.cov(stats[i])
+				X += [median, stdev, var, cov]
 			
+			# Removes temporary las
+			os.remove('tmp.las')
 			# 1 is validated, -1 is not validated
 			if validationModel.predict([X]) == -1:
 				return False
@@ -178,21 +309,20 @@ def pointCloud(validationModel, pointClouds, cropExtent, className, bb):
 def checkVisibility(image, crop, processedObjects, bbs):
 	visibleObjects = []
 
-	for key in bbs:
-		for bb in bbs[key]:
-			# The object is 100% inside the cropped image
-			if bb[0] >= crop[0] and bb[1] <= crop[1] and bb[2] >= crop[2] and bb[3] <= crop[3]:
-				# The object was already processed
-				if bb in processedObjects:
-					return []
-				else:
-					visibleObjects.append(bb)
-			# The object is 100% outside the cropped image
-			elif bb[1] < crop[0] or bb[0] > crop[1] or bb[3] < crop[2] or bb[2] > crop[3]:
-				continue
-			# The object is partially visible
-			else:
+	for bb in bbs:
+		# The object is 100% inside the cropped image
+		if bb[0] >= crop[0] and bb[1] <= crop[1] and bb[2] >= crop[2] and bb[3] <= crop[3]:
+			# The object was already processed
+			if bb in processedObjects:
 				return []
+			else:
+				visibleObjects.append(bb)
+		# The object is 100% outside the cropped image
+		elif bb[1] < crop[0] or bb[0] > crop[1] or bb[3] < crop[2] or bb[2] > crop[3]:
+			continue
+		# The object is partially visible
+		else:
+			return []
 
 	# Update list of processed objects
 	processedObjects.extend(visibleObjects)
@@ -200,7 +330,7 @@ def checkVisibility(image, crop, processedObjects, bbs):
 
 
 # Checks if bounding box is intersecting cropped image
-def intersection(bb, crop):
+def intersectsBb(bb, crop):
     return not (bb[1] < crop[0] or bb[0] > crop[1] or bb[3] < crop[2] or bb[2] > crop[3])
 
 
@@ -213,7 +343,7 @@ def LBRroi(polygons, bb):
 			intersection.append(polygon.intersection(p))
 	return intersection
 
-# Chekcs if the detection is intersecting a LBR polygon
+# Checks if the detection is intersecting a LBR polygon
 def LBR(roi, bb):
 	p = Polygon([(bb[0], bb[2]), (bb[0], bb[3]), (bb[1], bb[3]), (bb[1], bb[2])])
 	for polygon in roi:
@@ -228,24 +358,30 @@ def getExtent(img, extent, coords, width, height):
 	x2 = min(extent[2], coords[2])
 	y2 = min(extent[3], coords[3])
 
-	xMin = int(map(x1, extent[0], extent[2], 0, width))
-	xMax = int(map(x2, extent[0], extent[2], 0, width))
-	yMax = int(map(y1, extent[1], extent[3], height, 0))
-	yMin = int(map(y2, extent[1], extent[3], height, 0))
+	xMin = round(mapping(x1, extent[0], extent[2], 0, width))
+	xMax = round(mapping(x2, extent[0], extent[2], 0, width))
+	yMax = round(mapping(y1, extent[1], extent[3], height, 0))
+	yMin = round(mapping(y2, extent[1], extent[3], height, 0))
 
 	return (xMin, xMax, yMin, yMax)
 
 # Creates a dataset folder in YOLO format
-def createDatasetDir(datasetPath, imagesPath, labelsPath, imagesTrainPath, imagesValPath, labelsTrainPath, labelsValPath):
+def createDatasetDir(datasetPath, LASPath, imagesPath, labelsPath, imagesTrainPath, imagesValPath, labelsTrainPath, labelsValPath, labelsPolyTrain, labelsPolyVal):
 	if not os.path.exists(datasetPath):
 		os.makedirs(datasetPath)
+		os.makedirs(LASPath)
 		os.makedirs(imagesPath)
 		os.makedirs(labelsPath)
 		os.makedirs(imagesTrainPath)
 		os.makedirs(imagesValPath)
 		os.makedirs(labelsTrainPath)
 		os.makedirs(labelsValPath)
+		os.makedirs(labelsPolyTrain)
+		os.makedirs(labelsPolyVal)
 	else:
+		if not os.path.exists(LASPath):
+			os.makedirs(LASPath)
+
 		if not os.path.exists(imagesPath):
 			os.makedirs(imagesPath)
 			os.makedirs(imagesTrainPath)
@@ -260,11 +396,17 @@ def createDatasetDir(datasetPath, imagesPath, labelsPath, imagesTrainPath, image
 			os.makedirs(labelsPath)
 			os.makedirs(labelsTrainPath)
 			os.makedirs(labelsValPath)
+			os.makedirs(labelsPolyTrain)
+			os.makedirs(labelsPolyVal)
 		else:
 			if not os.path.exists(labelsTrainPath):
 				os.makedirs(labelsTrainPath)
 			if not os.path.exists(labelsValPath):
 				os.makedirs(labelsValPath)
+			if not os.path.exists(labelsPolyTrain):
+				os.makedirs(labelsPolyTrain)
+			if not os.path.exists(labelsPolyVal):
+				os.makedirs(labelsPolyVal)
 
 
 
@@ -282,14 +424,14 @@ def main():
 		# Standard YOLO resolution
 		resolution = 640
 
-		imgsz=resolution  # inference size (pixels)
+		imgsz=(resolution, resolution) # inference size (pixels)
 		conf_thres=0.25  # confidence threshold
 		iou_thres=0.45  # NMS IOU threshold
 		max_det=1000  # maximum detections per image
-		classes=None  # filter by class: --class 0, or --class 0 2 3
-		agnostic_nms=False  # class-agnostic NMS
-		cudnn.benchmark = True  # set True to speed up constant image size inference
-		device = "cpu"
+		agnostic_nms=False
+		classes=None
+		bs = 1  # batch
+		device = "0"  # 0 for gpu
 		device = select_device(device)
 
 		# YOLO model
@@ -310,21 +452,24 @@ def main():
 		validationModel = pickle.load(open("pointCloud.sav", "rb"))
 
 		# Load YOLO model
-		model = attempt_load(weights, map_location=device)
-		stride = int(model.stride.max())  # model stride
-		names = model.module.names if hasattr(model, "module") else model.names  # get class names
+		model = DetectMultiBackend(weights, device=device, dnn=False, fp16=False)
+		stride, names, pt = model.stride, model.names, model.pt
+		imgsz = check_img_size(imgsz, s=stride)  # check image size
+		model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
+		seen, windows, dt = 0, [], (Profile(), Profile(), Profile())
 
 		# Dictionary to store detections based on the class
 		aux = {}
-		for name in names:
+		for name in names.values():
 			aux[name] = []
 
 		# Path to the Point Clouds folder for the validation process
-		pointClouds = "../ODYSSEY/LAS"
-
-		
-		#validated = 0
-		#detections = 0
+		pointClouds = "LAS"
+		# Index Point Clouds to a tree for faster search later on
+		spindex = pyqtree.Index(bbox=(0, 0, 100, 100))
+		for cloud in os.listdir(pointClouds):
+			with laspy.open(pointClouds + '/' + cloud) as f:
+				spindex.insert(pointClouds + '/' + cloud, (f.header.x_min, f.header.y_min, f.header.x_max, f.header.y_max))
 
 		# Iterates over the images
 		for image in images:
@@ -347,8 +492,8 @@ def main():
 			bbs = poly2bb(annotations, xMinImg, xMaxImg, yMaxImg, yMinImg, width, height)
 
 			# Sliding window going through the extent of interest
-			for i in range(extent[0], extent[1], resolution):
-				for j in range(extent[2], extent[3], resolution):
+			for i in range(extent[0], extent[1], resolution//2):
+				for j in range(extent[2], extent[3], resolution//2):
 
 					croppedOriginalImg = img.crop((i, j, resolution+i, resolution+j))
 					cropExtent = [i, resolution+i, j, resolution+j]
@@ -357,131 +502,99 @@ def main():
 					displayImg = croppedImg.copy()
 
 					# Maps the cropped image extent from pixels to real world coordinates
-					xMin = map(cropExtent[0], 0, width, xMinImg, xMaxImg)
-					xMax = map(cropExtent[1], 0, width, xMinImg, xMaxImg)
-					yMax = map(cropExtent[2], height, 0, yMinImg, yMaxImg)
-					yMin = map(cropExtent[3], height, 0, yMinImg, yMaxImg)
+					xMin = mapping(cropExtent[0], 0, width, xMinImg, xMaxImg)
+					xMax = mapping(cropExtent[1], 0, width, xMinImg, xMaxImg)
+					yMax = mapping(cropExtent[2], height, 0, yMinImg, yMaxImg)
+					yMin = mapping(cropExtent[3], height, 0, yMinImg, yMaxImg)
 
 					# Return the LBR polygons that intersect this region
 					roiPolygons = LBRroi(polygons, (xMin,xMax,yMin,yMax))
 
 					# If so, attempts to detect objects in that region
 					if len(roiPolygons) > 0:
-						roiBbs = []
-						for key in bbs:
-							for bb in bbs[key]:
-								# Saves annotated objects in this region to a list
-								if intersection(bb, cropExtent):
-									xMin = int(map(bb[0], i, i+resolution, 0, resolution))
-									xMax = int(map(bb[1], i, i+resolution, 0, resolution))
-									yMin = int(map(bb[2], j, j+resolution, 0, resolution))
-									yMax = int(map(bb[3], j, j+resolution, 0, resolution))
-									roiBbs.append((xMin, xMax, yMin, yMax))
-									#cv2.rectangle(displayImg, (xMin, yMin), (xMax,yMax), (255,0,0), 2)
+						annotatedBbs = []
+						for bb in bbs:
+							# Saves annotated objects in this region to a list
+							if intersectsBb(bb, cropExtent):
+								xMin = round(mapping(bb[0], i, i+resolution, 0, resolution))
+								xMax = round(mapping(bb[1], i, i+resolution, 0, resolution))
+								yMin = round(mapping(bb[2], j, j+resolution, 0, resolution))
+								yMax = round(mapping(bb[3], j, j+resolution, 0, resolution))
+								annotatedBbs.append((xMin, xMax, yMin, yMax))
 
 						# Convert croppedImg to YOLO format for inference			
-						croppedImg = letterbox(croppedImg, imgsz, stride=stride, auto=True)[0]
-						croppedImg = croppedImg.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-						croppedImg = np.ascontiguousarray(croppedImg)
-						croppedImg = torch.from_numpy(croppedImg).to(device)
-						croppedImg = croppedImg.float()
-						croppedImg /= 255  # 0 - 255 to 0.0 - 1.0
-						if len(croppedImg.shape) == 3:
-							croppedImg = croppedImg[None]  # expand for batch dim
+						with dt[0]:
+							im = letterbox(croppedImg, imgsz, stride=stride, auto=True)[0]
+							# Convert
+							im = im.transpose((2, 0, 1))[::-1]  # HWC to CHW
+							im = np.ascontiguousarray(im)
+							im = torch.from_numpy(im).to(model.device)
+							im = im.half() if model.fp16 else im.float()  # uint8 to fp16/32
+							im /= 255  # 0 - 255 to 0.0 - 1.0
+							if len(im.shape) == 3:
+								im = im[None]  # expand for batch dim
 
-						# Inference
-						pred = model(croppedImg)[0]
-						pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
+						with dt[1]:
+							pred = model(im, augment=False, visualize=False)
 
-						#boxes = 0
+						# NMS
+						with dt[2]:
+							pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
 
 						# Iterates over the detections
 						for x, det in enumerate(pred):
 							if len(det):
 								# Rescale boxes from img_size to im0 size
-								det[:, :4] = scale_coords(croppedImg.shape[2:], det[:, :4], displayImg.shape).round()
+								det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], displayImg.shape).round()
 
 								for *xyxy, conf, cls in reversed(det):
-									#cv2.rectangle(displayImg, (int(xyxy[0]), int(xyxy[1])), (int(xyxy[2]), int(xyxy[3])), (0,255,255), 1)
 									# Convert detection to real world coordinates
-									GISbb, strGISbb = convert2GIS(xyxy, cropExtent, width, height, resolution, xMinImg, yMinImg, xMaxImg, yMaxImg)
+									GISbb = convert2GIS(xyxy, cropExtent, width, height, resolution, xMinImg, yMinImg, xMaxImg, yMaxImg)
 									
-									# Chekcs if the detection is intersecting a LBR polygon
+									# Checks if the detection is intersecting a LBR polygon
 									lbr = LBR(roiPolygons, GISbb)
 
 									if lbr:
 										c = int(cls)  # integer class
 										className = names[c]
 
-										# Validation using Point Clouds
-										validation = pointCloud(validationModel, pointClouds, cropExtent, className, GISbb)
-										
-										# Checks if the detection is already annotated or not
+										# [!] Warning about the Local Outlier Factor algorithm used for the point cloud validation
+										#
+										# When novelty is set to True be aware that you must only use predict, decision_function and score_samples 
+										# on new unseen data and not on the training samples as this would lead to wrong results. I.e., the result 
+										# of predict will not be the same as fit_predict
+										#
+										# Source: https://scikit-learn.org/stable/modules/outlier_detection.html#outlier-detection
 										annotated = False
-										for b in roiBbs:
+										for b in annotatedBbs:
 											if getIou(b, (int(xyxy[0]), int(xyxy[2]), int(xyxy[1]), int(xyxy[3]))) > 0.2:
 												annotated = True
 												break
 
-										#if validation == False:
-											#if annotated == False:
-												#detections += 1
-												#boxes += 1
-												#color = (0,0,255)	
-												#cv2.rectangle(displayImg, (int(xyxy[0]), int(xyxy[1])), (int(xyxy[2]), int(xyxy[3])), color, 2)
+										# Validation using Point Clouds
+										validation = False
+										if annotated == False:
+											validation = pointCloud(spindex, validationModel, pointClouds, cropExtent, className, GISbb)
 										
-										# Saves detections validated by both Point Clouds and LBR
-										if (validation == True or validation == -1) and annotated == False:
-											if annotated == False:
-												#detections += 1
-												#boxes += 1
-												#color = (0,255,0)
-												#print("Detection validated with point clouds and LBR")
-												#validated += 1
-												#cv2.rectangle(displayImg, (int(xyxy[0]), int(xyxy[1])), (int(xyxy[2]), int(xyxy[3])), color, 2)
-												aux[className].append(strGISbb)
-										#elif validation == -1:
-											# there is no point cloud for this region
-											#if annotated == False:
-												#detections += 1
-												#boxes += 1
-												#color = (0,255,0)
-												#print("Detection validated - No point cloud data here")
-												#validated += 1
-												#cv2.rectangle(displayImg, (int(xyxy[0]), int(xyxy[1])), (int(xyxy[2]), int(xyxy[3])), color, 2)
-												#aux[className].append(strGISbb)
-								
-									# debug
-									#else:
-									#	cv2.rectangle(displayImg, (int(xyxy[0]), int(xyxy[1])), (int(xyxy[2]), int(xyxy[3])), (255,255,255), 2)
-
-									
-									
-
-						
-						#if boxes > 0:
-						#	cv2.imshow("Cropped Image", displayImg)
-						#	cv2.waitKey(0)
+										if validation == True or annotated == True:	
+											aux[className].append(GISbb)
 
 			img.close()
-
-
-		#print("[===========================]")
-		#print("Detections:", detections)
-		#print("Validated detections:", validated)
-		#print("[===========================]")
 
 		# Populates dictionary with the validated detections to return 
 		data = {}
 		for key in aux.keys():
 			if len(aux[key]) != 0:
-				data[key] = "MULTIPOLYGON ("			
-				for i in range(len(aux[key])):
+				data[key] = "MULTIPOLYGON ("
+			finalValidated = nms(aux[key], iou_thres)
+			for i in range(len(finalValidated)):
+				xMin, xMax, yMin, yMax = finalValidated[i]
+				strGISbb = '((' + str(xMin) + ' ' + str(yMin) + ', ' + str(xMin) + ' ' + str(yMax) + ', ' + str(xMax) + ' ' + str(yMax) + ', ' + str(xMax) + ' ' + str(yMin) + '))'
+				if i != len(finalValidated)-1:
+					data[key] += strGISbb + ", "
+				else:
+					data[key] += strGISbb + ")"
 				
-					if i != len(aux[key])-1:
-						data[key] += aux[key][i] + ", "
-					else:
-						data[key] += aux[key][i] + ")"
 		
 		# Deletes temporary las file used for the Point Cloud validation
 		if os.path.isfile("tmp.las"):
@@ -503,14 +616,27 @@ def main():
 
 		# Creates dataset folder in YOLOv5 format
 		datasetPath = "dataset/"
+		LASPath = datasetPath + "LAS/"
 		imagesPath = datasetPath + "images/"
 		labelsPath = datasetPath + "labels/"
 		imagesTrainPath = imagesPath + "train/"
 		imagesValPath = imagesPath + "val/"
 		labelsTrainPath = labelsPath + "train/"
 		labelsValPath = labelsPath + "val/"
+		labelsPolyTrain = labelsPath + "trainPoly/"
+		labelsPolyVal = labelsPath + "valPoly/"
 
-		createDatasetDir(datasetPath, imagesPath, labelsPath, imagesTrainPath, imagesValPath, labelsTrainPath, labelsValPath)
+		createDatasetDir(datasetPath, LASPath, imagesPath, labelsPath, imagesTrainPath, imagesValPath, labelsTrainPath, labelsValPath, labelsPolyTrain, labelsPolyVal)
+
+
+		# Path to the Point Clouds folder to store archaeological site points to train a Local Outlier Factor later
+		pointClouds = "LAS"
+		# Index Point Clouds to a tree for faster search later on
+		spindex = pyqtree.Index(bbox=(0, 0, 100, 100))
+		for cloud in os.listdir(pointClouds):
+			with laspy.open(pointClouds + '/' + cloud) as f:
+				spindex.insert(pointClouds + '/' + cloud, (f.header.x_min, f.header.y_min, f.header.x_max, f.header.y_max))
+
 
 		# Standard YOLO resolution
 		resolution = 640
@@ -527,8 +653,11 @@ def main():
 			label+=1
 		classesFile.close()
 
+		pathFile = open(datasetPath + "paths.txt", "a+")
+
 		# Iterates over the images
 		for image in images:
+			pathFile.write(image + "\n")
 			# List to save all the objects that are processed to keep uniqueness
 			processedObjects = []
 
@@ -548,72 +677,94 @@ def main():
 			bbs = poly2bb(annotations, xMinImg, xMaxImg, yMaxImg, yMinImg, width, height)
 
 			# Iterates over the bounding boxes
-			for key in bbs:
-				for bb in bbs[key]:
-					# Check if bounding box is unique
-					if bb not in processedObjects:
-						# Randomizes a list of unique points covering a range around the object
-						x = list(range(bb[1]-resolution//2, bb[0]+resolution//2))
-						y = list(range(bb[3]-resolution//2, bb[2]+resolution//2))
-						random.shuffle(x)
-						random.shuffle(y)
+			for bb in bbs:
+				# Check if bounding box is unique
+				if bb not in processedObjects:
+					# Randomizes a list of unique points covering a range around the object
+					x = list(range(bb[1]-resolution//2, bb[0]+resolution//2))
+					y = list(range(bb[3]-resolution//2, bb[2]+resolution//2))
+					random.shuffle(x)
+					random.shuffle(y)
 
-						# List to save 100% visible objects
-						visibleObjects = []
-						crop = []
+					# List to save 100% visible objects
+					visibleObjects = []
+					crop = []
 
-						# Iterates over the list of random points
-						for i in x:
-							if visibleObjects:
-								break
-							for j in y:
-								# Gets a region of interest expanding the random point into a region of interest with a certain resolution
-								crop = (i-resolution//2, i+resolution//2, j-resolution//2, j+resolution//2)
-								# Checks if that region of interest only covers 100% visible objects
-								visibleObjects = checkVisibility(image, crop, processedObjects, bbs)
-								if visibleObjects:
-									break
-
-						# If we obtain a list of visible objects within a region of interest, we save it
+					# Iterates over the list of random points
+					while len(x) > 0 and len(y) > 0:
+						i = random.choice(x)
+						j = random.choice(y)
+						x.remove(i)
+						y.remove(j)
+						# Gets a region of interest expanding the random point into a region of interest with a certain resolution
+						crop = (i-resolution//2, i+resolution//2, j-resolution//2, j+resolution//2)
+						# Checks if that region of interest only covers 100% visible objects
+						visibleObjects = checkVisibility(image, crop, processedObjects, bbs)
 						if visibleObjects:
-							# Uses the coordinates as the name of the image and text files
-							xMin = int(map(crop[0], 0, width, xMinImg, xMaxImg))
-							xMax = int(map(crop[1], 0, width, xMinImg, xMaxImg))
-							yMax = int(map(crop[2], height, 0, yMinImg, yMaxImg))
-							yMin = int(map(crop[3], height, 0, yMinImg, yMaxImg))
-							coords = "("+ str(xMin) + "_" + str(xMax) + "_" + str(yMin) + "_" + str(yMax) + ")"
+							break
 
-							# Training/Validation split
-							if np.random.uniform(0,1) > validationSize/100:
-								labelPath = labelsTrainPath
-								imagePath = imagesTrainPath				
-							else:
-								labelPath = labelsValPath
-								imagePath = imagesValPath
+					# If we obtain a list of visible objects within a region of interest, we save it
+					if visibleObjects:
+						# Uses the coordinates as the name of the image and text files
+						coords = '('+ str(crop[0]) + '_' + str(crop[1]) + '_' + str(crop[2]) + '_' + str(crop[3]) + ')'
 
-							# Writes the image
-							croppedImg = img.crop((crop[0], crop[2], crop[1], crop[3]))
-							imgName = imagePath + image.split(".")[0].split("/")[-1] + coords + ".png"
-							croppedImg.save(imgName)
+						
+						# Training/Validation split
+						if np.random.uniform(0,1) > validationSize/100:
+							labelPath = labelsTrainPath
+							polyPath = labelsPolyTrain
+							imagePath = imagesTrainPath				
+						else:
+							labelPath = labelsValPath
+							polyPath = labelsPolyVal
+							imagePath = imagesValPath
 
-							# Writes the label file
-							txtFile = open(labelPath + image.split(".")[0].split("/")[-1] + coords + ".txt", "a+")
-							for i in range(len(visibleObjects)):						
-								# Maps the object in YOLO format
-								centerX = (visibleObjects[i][0] + visibleObjects[i][1])/2.0
-								centerX = map(centerX, crop[0], crop[1], 0, 1)
-								centerY = (visibleObjects[i][2] + visibleObjects[i][3])/2.0
-								centerY = map(centerY, crop[2], crop[3], 0, 1)
-								w  = (centerX - map(visibleObjects[i][0], crop[0], crop[1], 0, 1)) * 2.0
-								h = (centerY - map(visibleObjects[i][2], crop[2], crop[3], 0, 1)) * 2.0
+						# Writes the image
+						croppedImg = img.crop((crop[0], crop[2], crop[1], crop[3]))
+						imgName = imagePath + image.split("/")[-1].split(".")[0] + coords + ".png"
+						croppedImg.save(imgName)
+
+						# Writes the label file in YOLO format
+						txtFile = open(labelPath + image.split("/")[-1].split(".")[0] + coords + ".txt", "a+")
+						for obj in visibleObjects:						
+							# Maps the object in YOLO format
+							centerX = (obj[0] + obj[1])/2.0
+							centerX = mapping(centerX, crop[0], crop[1], 0, 1)
+							centerY = (obj[2] + obj[3])/2.0
+							centerY = mapping(centerY, crop[2], crop[3], 0, 1)
+							w = (centerX - mapping(obj[0], crop[0], crop[1], 0, 1)) * 2.0
+							h = (centerY - mapping(obj[2], crop[2], crop[3], 0, 1)) * 2.0
 
 
-								# Writes/Appends the annotations to a text file that has the same name of the respective image
-								txtFile.write(str(classes[key]) + " " + str(centerX) + " " + str(centerY) + " " +str(w)+ " "+ str(h) + "\n")
+							# Writes/Appends the annotations to a text file that has the same name of the respective image
+							txtFile.write(str(classes[bbs[obj][0]]) + " " + str(centerX) + " " + str(centerY) + " " +str(w)+ " "+ str(h) + "\n")
 
-							txtFile.close()
+						txtFile.close()
+
+						# Writes the label file for the polygons to use on the Data Augmentation later
+						txtFile = open(polyPath + image.split("/")[-1].split(".")[0] + coords + ".txt", "a+")
+						for obj in visibleObjects:						
+							
+							poly = bbs[obj][1]
+
+							polygon = ""
+							for p in poly:
+								polygon += " "
+								pX = round(mapping(p[0], crop[0], crop[1], 0, resolution))
+								pY = round(mapping(p[1], crop[2], crop[3], 0, resolution))
+								polygon += str(pX) + " " + str(pY)	
+
+							# Writes/Appends the annotations to a text file that has the same name of the respective image
+							txtFile.write(str(classes[bbs[obj][0]]) + polygon + "\n")
+
+						txtFile.close()
+
+
+						pointCloudCrop(spindex, LASPath, image, coords, crop, visibleObjects, imgName, pointClouds, xMinImg, xMaxImg, yMinImg, yMaxImg, width, height, resolution)
+
 
 		img.close()
+		pathFile.close()
 
 	return ("", 204)
 

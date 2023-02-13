@@ -18,7 +18,7 @@ def polys(row):
 
 	return (xPoints, yPoints)
 
-#URL = 'http://192.168.1.65:8080'
+#URL = 'http://192.168.1.65:8082'
 URL = 'http://127.0.0.1:5000'
 annotations = ['../ODYSSEY/Images/LRM/PNPG.csv', '../ODYSSEY/Images/LRM/Arcos.csv']
 #DTM = 'Arcos.tif'
@@ -60,10 +60,11 @@ for annotation in annotations:
 
 	data[classes[x]] = polygons
 	x+=1
+	print(count)
 
-purpose = 'inference' # training/inference
+purpose = 'training' # training/inference
 
-print(count)
+
 
 types = ['LRM']
 multipleFiles = [('annotations', json.dumps(data)), ('geotiff', json.dumps(path)), ('coords', json.dumps(coords)), ('purpose', purpose)]

@@ -62,6 +62,7 @@ def main():
 		aux = label.split('/')[-1]
 		image = datasetPath + '/images/' + trainval + '/' + aux.split('.')[0] + '.png'
 
+		print(image.split("/")[-1])
 
 		# Opens both the labels and images
 		f = open(label, "r")
@@ -71,6 +72,7 @@ def main():
 		# Extracts the bounding boxes from the labels, which are in YOLO format
 
 		for line in f:
+			objects +=1
 			#class_label = line.split(' ')[0]
 			color = (255,0,0)
 
@@ -90,6 +92,8 @@ def main():
 
 		cv2.imshow('img', img)
 		cv2.waitKey()
+
+	print(objects)
 
 
 if __name__ == "__main__":
