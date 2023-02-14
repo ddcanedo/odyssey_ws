@@ -471,7 +471,7 @@ def main():
 				if len(roiPolygons) > 0:
 					
 					xx = list(range(i, i+resolution))
-					yy = list(range(j, i+resolution))
+					yy = list(range(j, j+resolution))
 
 					while copies < objectAugmentations and len(xx)>0 and len(yy)>0:
 						# restore list 
