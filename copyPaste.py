@@ -93,7 +93,7 @@ def createDatasetDir(datasetPath, imagesPath, labelsPath, imagesTrainPath, image
 				os.makedirs(labelsValPath)
 
 # Converts coordinates from GIS reference to image pixels
-def map(value, min1, max1, min2, max2):
+def mapping(value, min1, max1, min2, max2):
 	return (((value - min1) * (max2 - min2)) / (max1 - min1)) + min2
 
 def intersectsBb(bb, crop):
@@ -113,8 +113,8 @@ def convert2Pixels(annotations, region, width, height, resolution, xMinImg, yMin
 
 			cPoly = []
 			for p in poly[0]:
-				x = map(p[0], 0, resolution, int(cropExtent[0]), int(cropExtent[1]))
-				y = map(p[1], 0, resolution, int(cropExtent[2]), int(cropExtent[3]))
+				x = mapping(p[0], 0, resolution, int(cropExtent[0]), int(cropExtent[1]))
+				y = mapping(p[1], 0, resolution, int(cropExtent[2]), int(cropExtent[3]))
 				cPoly.append((x,y))
 
 			#polys.append((cPoly, poly[1]))
@@ -136,7 +136,7 @@ def LBRroi(polygons, bb):
 def LBR(roi, bb):
 	p = Polygon([(bb[0], bb[2]), (bb[0], bb[3]), (bb[1], bb[3]), (bb[1], bb[2])])
 	for polygon in roi:
-		if polygon.intersects(p):
+		if polygon.contains(p):
 			return True
 	return False
 
@@ -151,15 +151,15 @@ def intersectsPoly(polys, bb):
 # Convert the detection to real world coordinates
 def convert2GIS(xyxy, cropExtent, width, height, resolution, xMinImg, yMinImg, xMaxImg, yMaxImg):
 
-	xMin = map(int(xyxy[0]), 0, resolution, cropExtent[0], cropExtent[1])
-	xMax = map(int(xyxy[2]), 0, resolution, cropExtent[0], cropExtent[1])
-	yMin = map(int(xyxy[3]), 0, resolution, cropExtent[2], cropExtent[3])
-	yMax = map(int(xyxy[1]), 0, resolution, cropExtent[2], cropExtent[3])
+	xMin = mapping(int(xyxy[0]), 0, resolution, cropExtent[0], cropExtent[1])
+	xMax = mapping(int(xyxy[2]), 0, resolution, cropExtent[0], cropExtent[1])
+	yMin = mapping(int(xyxy[3]), 0, resolution, cropExtent[2], cropExtent[3])
+	yMax = mapping(int(xyxy[1]), 0, resolution, cropExtent[2], cropExtent[3])
 
-	xMin = map(xMin, 0, width, xMinImg, xMaxImg)
-	xMax = map(xMax, 0, width, xMinImg, xMaxImg)
-	yMax = map(yMax, height, 0, yMinImg, yMaxImg)
-	yMin = map(yMin, height, 0, yMinImg, yMaxImg)
+	xMin = mapping(xMin, 0, width, xMinImg, xMaxImg)
+	xMax = mapping(xMax, 0, width, xMinImg, xMaxImg)
+	yMax = mapping(yMax, height, 0, yMinImg, yMaxImg)
+	yMin = mapping(yMin, height, 0, yMinImg, yMaxImg)
 
 	return (xMin, xMax, yMin, yMax)
 
@@ -432,6 +432,10 @@ def main():
 
 		augmentations = 0
 		
+		flatList = []
+		for subList in list(polys.values()):
+			flatList.extend(subList)
+
 		while augmentations < augLoops and len(x)>0 and len(y)>0:
 			i = random.choice(x)
 			j = random.choice(y)
@@ -440,9 +444,6 @@ def main():
 			# Gets a region of interest
 			crop = (i, i+resolution, j, j+resolution)
 
-			flatList = []
-			for subList in list(polys.values()):
-				flatList.extend(subList)
 
 			# Verifies if there are no annotated sites on the proposed cropped image
 			if intersectsPoly(flatList, (crop[0], crop[1], crop[2], crop[3])) == False:
@@ -450,10 +451,10 @@ def main():
 				croppedImg = img.crop((crop[0], crop[2], crop[1], crop[3]))
 
 				# Maps the cropped image extent from pixels to real world coordinates
-				xMin = map(crop[0], 0, width, xMinImg, xMaxImg)
-				xMax = map(crop[1], 0, width, xMinImg, xMaxImg)
-				yMax = map(crop[2], height, 0, yMinImg, yMaxImg)
-				yMin = map(crop[3], height, 0, yMinImg, yMaxImg)
+				xMin = mapping(crop[0], 0, width, xMinImg, xMaxImg)
+				xMax = mapping(crop[1], 0, width, xMinImg, xMaxImg)
+				yMax = mapping(crop[2], height, 0, yMinImg, yMaxImg)
+				yMin = mapping(crop[3], height, 0, yMinImg, yMaxImg)
 				coords = "("+ str(round(xMin)) + "_" + str(round(xMax)) + "_" + str(round(yMin)) + "_" + str(round(yMax)) + ")"
 
 				# Return the LBR polygons that intersect this region
@@ -494,8 +495,8 @@ def main():
 
 						cPoly = []
 						for p in poly:
-							cX = map(p[0], minX, maxX, 0, w)
-							cY = map(p[1], minY, maxY, 0, h)
+							cX = mapping(p[0], minX, maxX, 0, w)
+							cY = mapping(p[1], minY, maxY, 0, h)
 							cPoly.append((cX,cY))
 
 						draw.polygon(cPoly, fill=255)
@@ -507,8 +508,13 @@ def main():
 
 						w,h = croppedPoly.size
 
+						copyXmin = mapping(ii, crop[0], crop[1], 0, resolution)
+						copyXmax = mapping(ii+w, crop[0], crop[1], 0, resolution)
+						copyYmin = mapping(jj, crop[2], crop[3], 0, resolution)
+						copyYmax = mapping(jj+h, crop[2], crop[3], 0, resolution)
+						
 						# Out of bounds
-						if ii+w > width or jj+h > height:
+						if copyXmax > resolution or copyYmax > resolution:
 							continue			
 
 						mask = mask.filter(ImageFilter.SMOOTH)
@@ -526,23 +532,17 @@ def main():
 						if blackPixels/len(pixels) >= 0.2:
 							continue
 
-						xMinBb = map(ii, 0, width, xMinImg, xMaxImg)
-						xMaxBb = map(ii+w, 0, width, xMinImg, xMaxImg)
-						yMaxBb = map(jj, height, 0, yMinImg, yMaxImg)
-						yMinBb = map(jj+h, height, 0, yMinImg, yMaxImg)
+						xMinBb = mapping(ii, 0, width, xMinImg, xMaxImg)
+						xMaxBb = mapping(ii+w, 0, width, xMinImg, xMaxImg)
+						yMaxBb = mapping(jj, height, 0, yMinImg, yMaxImg)
+						yMinBb = mapping(jj+h, height, 0, yMinImg, yMaxImg)
 
 						lbr = LBR(roiPolygons, (xMinBb,xMaxBb,yMinBb,yMaxBb))
 						intersecting = intersectsPoly(previousPolys, (ii,ii+w, jj,jj+h))
 
 						if lbr == True and intersecting == False and len(xx):
 
-							previousPolys.append(((ii, jj), (ii, jj+h), (ii+w, jj+h), (ii+w, jj)))
-
-							copyXmin = map(ii, crop[0], crop[1], 0, resolution)
-							copyXmax = map(ii+w, crop[0], crop[1], 0, resolution)
-							copyYmin = map(jj, crop[2], crop[3], 0, resolution)
-							copyYmax = map(jj+h, crop[2], crop[3], 0, resolution)
-							
+							previousPolys.append(((ii, jj), (ii, jj+h), (ii+w, jj+h), (ii+w, jj)))						
 
 							croppedImg.paste(croppedPoly, (round(copyXmin),round(copyYmin)), mask)
 							copyBbs.append([copyXmin, copyYmin, copyXmax, copyYmax])
@@ -575,11 +575,11 @@ def main():
 					for z in range(len(transformedBboxes)):						
 						# Maps the object in YOLO format
 						centerX = (transformedBboxes[z][0] + transformedBboxes[z][2])/2.0
-						centerX = map(centerX, 0, resolution, 0, 1)
+						centerX = mapping(centerX, 0, resolution, 0, 1)
 						centerY = (transformedBboxes[z][1] + transformedBboxes[z][3])/2.0
-						centerY = map(centerY, 0, resolution, 0, 1)
-						w = (centerX - map(transformedBboxes[z][0], 0, resolution, 0, 1)) * 2.0
-						h = (centerY - map(transformedBboxes[z][1], 0, resolution, 0, 1)) * 2.0
+						centerY = mapping(centerY, 0, resolution, 0, 1)
+						w = (centerX - mapping(transformedBboxes[z][0], 0, resolution, 0, 1)) * 2.0
+						h = (centerY - mapping(transformedBboxes[z][1], 0, resolution, 0, 1)) * 2.0
 
 						# Writes/Appends the annotations to a text file that has the same name of the respective image
 						txtFile.write(str(transformedClassLabels[z]) + " " + str(centerX) + " " + str(centerY) + " " +str(w)+ " "+ str(h) + "\n")
@@ -599,18 +599,13 @@ def main():
 			# Gets a region of interest
 			crop = (i, i+resolution, j, j+resolution)
 
-
-			flatList = []
-			for subList in list(polys.values()):
-				flatList.extend(subList)
-
 			if intersectsPoly(flatList, (crop[0], crop[1], crop[2], crop[3])) == False:
 
 				# Maps the cropped image extent from pixels to real world coordinates
-				xMin = map(crop[0], 0, width, xMinImg, xMaxImg)
-				xMax = map(crop[1], 0, width, xMinImg, xMaxImg)
-				yMax = map(crop[2], height, 0, yMinImg, yMaxImg)
-				yMin = map(crop[3], height, 0, yMinImg, yMaxImg)
+				xMin = mapping(crop[0], 0, width, xMinImg, xMaxImg)
+				xMax = mapping(crop[1], 0, width, xMinImg, xMaxImg)
+				yMax = mapping(crop[2], height, 0, yMinImg, yMaxImg)
+				yMin = mapping(crop[3], height, 0, yMinImg, yMaxImg)
 
 				# 10% background images
 				bgImg = img.crop((crop[0], crop[2], crop[1], crop[3]))
@@ -631,10 +626,10 @@ def main():
 					bgCount += 1
 					previousSize += 1
 					# Maps the cropped image extent from pixels to real world coordinates
-					xMin = map(crop[0], 0, width, xMinImg, xMaxImg)
-					xMax = map(crop[1], 0, width, xMinImg, xMaxImg)
-					yMax = map(crop[2], height, 0, yMinImg, yMaxImg)
-					yMin = map(crop[3], height, 0, yMinImg, yMaxImg)
+					xMin = mapping(crop[0], 0, width, xMinImg, xMaxImg)
+					xMax = mapping(crop[1], 0, width, xMinImg, xMaxImg)
+					yMax = mapping(crop[2], height, 0, yMinImg, yMaxImg)
+					yMin = mapping(crop[3], height, 0, yMinImg, yMaxImg)
 					coords = "("+ str(round(xMin)) + "_" + str(round(xMax)) + "_" + str(round(yMin)) + "_" + str(round(yMax)) + ")"
 					imgName = imgSavePath + region + coords + str(previousSize) + ".png"
 					

@@ -343,11 +343,11 @@ def LBRroi(polygons, bb):
 			intersection.append(polygon.intersection(p))
 	return intersection
 
-# Checks if the detection is intersecting a LBR polygon
+# Checks if a LBR polygon contains the detection
 def LBR(roi, bb):
 	p = Polygon([(bb[0], bb[2]), (bb[0], bb[3]), (bb[1], bb[3]), (bb[1], bb[2])])
 	for polygon in roi:
-		if polygon.intersects(p):
+		if polygon.contains(p):
 			return True
 	return False
 
@@ -464,7 +464,7 @@ def main():
 			aux[name] = []
 
 		# Path to the Point Clouds folder for the validation process
-		pointClouds = "LAS"
+		pointClouds = "../ODYSSEY/LAS"
 		# Index Point Clouds to a tree for faster search later on
 		spindex = pyqtree.Index(bbox=(0, 0, 100, 100))
 		for cloud in os.listdir(pointClouds):
@@ -630,7 +630,7 @@ def main():
 
 
 		# Path to the Point Clouds folder to store archaeological site points to train a Local Outlier Factor later
-		pointClouds = "LAS"
+		pointClouds = "../ODYSSEY/LAS"
 		# Index Point Clouds to a tree for faster search later on
 		spindex = pyqtree.Index(bbox=(0, 0, 100, 100))
 		for cloud in os.listdir(pointClouds):
