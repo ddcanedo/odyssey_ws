@@ -431,7 +431,7 @@ def main():
 		agnostic_nms=False
 		classes=None
 		bs = 1  # batch
-		device = "0"  # 0 for gpu
+		device = "1"  # 0 for gpu
 		device = select_device(device)
 
 		# YOLO model
@@ -461,10 +461,10 @@ def main():
 		# Dictionary to store detections based on the class
 		aux = {}
 		for name in names.values():
-			aux[name] = []
+			aux[name.capitalize()] = []
 
 		# Path to the Point Clouds folder for the validation process
-		pointClouds = "../ODYSSEY/LAS"
+		pointClouds = "LAS"
 		# Index Point Clouds to a tree for faster search later on
 		spindex = pyqtree.Index(bbox=(0, 0, 100, 100))
 		for cloud in os.listdir(pointClouds):
@@ -556,7 +556,8 @@ def main():
 
 									if lbr:
 										c = int(cls)  # integer class
-										className = names[c]
+										className = names[c].capitalize()
+										#className.capitalize() = names[c]
 
 										# [!] Warning about the Local Outlier Factor algorithm used for the point cloud validation
 										#
@@ -589,7 +590,7 @@ def main():
 			finalValidated = nms(aux[key], iou_thres)
 			for i in range(len(finalValidated)):
 				xMin, xMax, yMin, yMax = finalValidated[i]
-				strGISbb = '((' + str(xMin) + ' ' + str(yMin) + ', ' + str(xMin) + ' ' + str(yMax) + ', ' + str(xMax) + ' ' + str(yMax) + ', ' + str(xMax) + ' ' + str(yMin) + '))'
+				strGISbb = '((' + str(xMin) + ' ' + str(yMax) + ',' + str(xMax) + ' ' + str(yMax) + ',' + str(xMax) + ' ' + str(yMin) + ',' + str(xMin) + ' ' + str(yMin) + ',' + str(xMin) + ' ' + str(yMax) +'))'
 				if i != len(finalValidated)-1:
 					data[key] += strGISbb + ", "
 				else:
@@ -630,7 +631,7 @@ def main():
 
 
 		# Path to the Point Clouds folder to store archaeological site points to train a Local Outlier Factor later
-		pointClouds = "../ODYSSEY/LAS"
+		pointClouds = "LAS"
 		# Index Point Clouds to a tree for faster search later on
 		spindex = pyqtree.Index(bbox=(0, 0, 100, 100))
 		for cloud in os.listdir(pointClouds):
@@ -769,4 +770,3 @@ def main():
 	return ("", 204)
 
 if __name__ == "__main__":
-	app.run()
