@@ -21,7 +21,7 @@ import pickle
 from flask import request, Flask
 import json
 from jakteristics import las_utils, compute_features, FEATURE_NAMES
-from shapely.geometry import Point, Polygon
+from shapely.geometry import Point, Polygon, MultiPolygon
 from shapely.wkt import loads
 import random
 import pyqtree
@@ -35,46 +35,41 @@ Image.MAX_IMAGE_PIXELS = None
 def poly2bb(annotations, xMinImg, xMaxImg, yMaxImg, yMinImg, width, height):
 	bbs = {}
 	for key in annotations:
-		wkt = annotations[key].replace(", ", ",")
+		geometry = loads(annotations[key])
 
-		polygonStrings = wkt[16:-3].split(")),((")
-		
-		# Iterate through the polygon strings
-		for polygonStr in polygonStrings:
-			# Split the polygon string into point strings
-			pointStrings = polygonStr.split(",")
-			polygonPoints = []
-			xPoints = []
-			yPoints = []
-			# Iterate through the point strings
-			for pointStr in pointStrings:
-				# Split the point string into x and y values
-				x, y = map(float, pointStr.split(" "))
-				xPoints.append(x)
-				yPoints.append(y)
-				polygonPoints.append([x, y])
+		if isinstance(geometry, MultiPolygon):
+			for polygon in geometry:
+				x_coords, y_coords = polygon.exterior.xy
+				xPoints = []
+				yPoints = []
+				polygonPoints = []
+				# Iterate through the points
+				for x, y in zip(x_coords, y_coords):
+					xPoints.append(x)
+					yPoints.append(y)
+					polygonPoints.append([x, y])
 
-			xMin = min(xPoints)
-			xMax = max(xPoints)
-			yMin = min(yPoints)
-			yMax = max(yPoints)
+				xMin = min(xPoints)
+				xMax = max(xPoints)
+				yMin = min(yPoints)
+				yMax = max(yPoints)
 
-			# The bounding box must be within the image limits
-			if xMin >= xMinImg and xMax <= xMaxImg and yMin >= yMinImg and yMax <= yMaxImg:
+				# The bounding box must be within the image limits
+				if xMin >= xMinImg and xMax <= xMaxImg and yMin >= yMinImg and yMax <= yMaxImg:
 
-				# Maps coordinates from GIS reference to image pixels
-				xMinBb = round(mapping(xMin, xMinImg, xMaxImg, 0, width))
-				xMaxBb = round(mapping(xMax, xMinImg, xMaxImg, 0, width))
-				yMaxBb = round(mapping(yMin, yMinImg, yMaxImg, height, 0))
-				yMinBb = round(mapping(yMax, yMinImg, yMaxImg, height, 0))
+					# Maps coordinates from GIS reference to image pixels
+					xMinBb = round(mapping(xMin, xMinImg, xMaxImg, 0, width))
+					xMaxBb = round(mapping(xMax, xMinImg, xMaxImg, 0, width))
+					yMaxBb = round(mapping(yMin, yMinImg, yMaxImg, height, 0))
+					yMinBb = round(mapping(yMax, yMinImg, yMaxImg, height, 0))
 
-				polygon = []
-				for p in polygonPoints:
-					xPoly = mapping(p[0], xMinImg, xMaxImg, 0, width)
-					yPoly = mapping(p[1], yMinImg, yMaxImg, height, 0)
-					polygon.append([xPoly, yPoly])
+					polygon = []
+					for p in polygonPoints:
+						xPoly = mapping(p[0], xMinImg, xMaxImg, 0, width)
+						yPoly = mapping(p[1], yMinImg, yMaxImg, height, 0)
+						polygon.append([xPoly, yPoly])
 
-				bbs[(xMinBb, xMaxBb, yMinBb, yMaxBb)] = [key, polygon]
+					bbs[(xMinBb, xMaxBb, yMinBb, yMaxBb)] = [key, polygon]
 
 	return bbs
 
@@ -420,7 +415,9 @@ def main():
 		annotations = json.loads(request.form["annotations"])
 		images = json.loads(request.form["geotiff"])
 		coordinates = json.loads(request.form["coords"])
-
+		algorithm = request.form["algorithm"]
+		model = request.form["model"]
+		
 		# Standard YOLO resolution
 		resolution = 640
 
@@ -435,10 +432,10 @@ def main():
 		device = select_device(device)
 
 		# YOLO model
-		weights = "best.pt"
+		weights = "algorithms/" + algorithm + "/" + model
 
 		# LBR model
-		polygonsCsv = "LBR.csv"
+		polygonsCsv = "Portugal_LBR.csv"
 
 		# Get the polygons from the LBR model
 		polygons = []
@@ -446,7 +443,9 @@ def main():
 			reader = csv.DictReader(csvfile)
 			for row in reader:
 				p = loads(row["WKT"])
-				polygons.append(p)
+				coords_polygon = Polygon([(coordinates[0], coordinates[1]), (coordinates[0], coordinates[3]), (coordinates[2], coordinates[3]), (coordinates[2], coordinates[1])])
+				if p.intersects(coords_polygon):
+					polygons.append(p)
 
 		# Validation model trained with Point Clouds
 		validationModel = pickle.load(open("pointCloud.sav", "rb"))
@@ -577,7 +576,7 @@ def main():
 										if annotated == False:
 											validation = pointCloud(spindex, validationModel, pointClouds, cropExtent, className, GISbb)
 										
-										if validation == True or annotated == True:	
+										if validation != False:	
 											aux[className].append(GISbb)
 
 			img.close()
@@ -595,17 +594,17 @@ def main():
 					data[key] += strGISbb + ", "
 				else:
 					data[key] += strGISbb + ")"
-				
-		
+
 		# Deletes temporary las file used for the Point Cloud validation
 		if os.path.isfile("tmp.las"):
 			os.remove("tmp.las")
-
+		print(data)
 		return data
 
 
 	# Training =============================================================================
 	elif request.form["purpose"] == "training":
+
 		# loads annotations and paths
 		annotations = json.loads(request.form["annotations"])
 		images = json.loads(request.form["geotiff"])
@@ -767,6 +766,29 @@ def main():
 		img.close()
 		pathFile.close()
 
-	return ("", 204)
+
+
+@app.route("/algorithm", methods=["GET", "POST"])
+def get_list_algorithm():
+	algo_lst = []
+	with os.scandir('algorithms/') as itr:
+		for entry in itr :
+			algo_lst.append(entry.name)
+
+	return algo_lst
+
+
+@app.route("/model", methods=["GET", "POST"])
+def get_list_model():
+	algorithm = request.args.get("algorithm")
+	model_lst = []
+
+	with os.scandir('algorithms/' + algorithm + '/') as itr:
+		for entry in itr :
+			model_lst.append(entry.name)
+
+	return model_lst
+
 
 if __name__ == "__main__":
+	app.run()
